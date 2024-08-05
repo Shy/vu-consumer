@@ -1,8 +1,9 @@
-from flask import Flask
+from flask import Flask, redirect, url_for
 import os
 import datetime
 from dotenv import load_dotenv
 import requests
+from flask_dance.contrib.spotify import make_spotify_blueprint, spotify
 import pendulum
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -10,16 +11,20 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from requests_oauthlib import OAuth2Session
 from svglib.svglib import svg2rlg
 from reportlab.graphics.renderPM import drawToPIL
 from flask_apscheduler import APScheduler
 from io import BytesIO
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 
 load_dotenv()
 
 
 class Config:
     SCHEDULER_API_ENABLED = True
+    PREFERRED_URL_SCHEME = "https"
 
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
@@ -33,22 +38,11 @@ data = r.json()
 weather_dial_UID = data["data"][0]["uid"]
 cal_dial_UID = data["data"][1]["uid"]
 
+
 # Location load. Requires 4 digits after the decimal.
 lat = os.getenv("LOCATION_LAT")
 lon = os.getenv("LOCATION_LON")
-
-# Weather.gov API URL. See https://www.weather.gov/documentation/services-web-api for more information.
-weatherGovURL = "https://api.weather.gov/"
-r = requests.get(f"https://api.weather.gov/points/{lat},{lon}")
-data = r.json()
-forcastURL = data["properties"]["forecast"]
-name = f'{data["properties"]["relativeLocation"]["properties"]["city"]}'
-
-# NYC ranges from  8°F (−13 °C) and 97 °F. Ideally I .would set this based on the location.
-# Gotta find a free API for that one.
-cityLow = 8
-cityHigh = 97
-cityUnit = "°F"
+openweather_token = os.getenv("openweather_token")
 
 # Load in svg icon. This is from the font awesome free pack. See https://fontawesome.com/
 weather_icon_path = "assets/images/temperature-half.svg"
@@ -92,35 +86,97 @@ def generateScale(low, high, unit, name, icon_path):
     return image_file
 
 
-# Set Scale for first Dial on server boot.
-weatherScale = generateScale(cityLow, cityHigh, cityUnit, name, weather_icon_path)
-r = requests.post(
-    f"http://localhost:5340/api/v0/dial/{weather_dial_UID}/image/set",
-    params={"key": VU_Key, "imgfile": "my_awesome_image.png"},
-    files={"imgfile": weatherScale},
-)
-
 app = Flask(__name__)
+# App is behind one proxy that sets the -For and -Host headers.
 app.config.from_object(Config())
+app.secret_key = "supersekrit"
+blueprint = make_spotify_blueprint(
+    client_id=os.getenv("SPOTIPY_CLIENT_ID"),
+    client_secret=(os.getenv("SPOTIPY_CLIENT_SECRET")),
+)
+app.register_blueprint(blueprint, url_prefix="/login")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
 scheduler = APScheduler()
 scheduler.init_app(app)
+dailyMinTemp = 8
+dailyMaxTemp = 97
 
 
-# @app.route("/")
+@scheduler.task("cron", id="buildWeatherScale", hour="8", misfire_grace_time=900)
+def buildWeatherScale():
+    print("Setting Weather Scale")
+    URL = (
+        "https://api.openweathermap.org/data/2.5/forecast/daily?units=imperial"
+        + "&lat={}".format(lat)
+        + "&lon={}".format(lon)
+        + "&appid={}".format(openweather_token)
+    )
+    resp = requests.get(URL)
+    forecast = resp.json()
+    # dailyMinTemp = forecast["list"][0]["main"]["temp_min"]
+    # dailyMaxTemp = forecast["list"][0]["main"]["temp_max"]
+    # for time in forecast["list"]:
+    #     print(time["main"])
+    #     if time["main"]["temp_min"] < dailyMinTemp:
+    #         dailyMinTemp = time["main"]["temp_min"]
+    #     if time["main"]["temp_max"] > dailyMaxTemp:
+    #         dailyMaxTemp = time["main"]["temp_max"]
+    weatherScale = generateScale(
+        int(dailyMinTemp),
+        int(dailyMaxTemp),
+        "°F",
+        "Weather",
+        weather_icon_path,
+    )
+
+    r = requests.post(
+        f"http://localhost:5340/api/v0/dial/{weather_dial_UID}/image/set",
+        params={"key": VU_Key, "imgfile": "my_awesome_image.png"},
+        files={"imgfile": weatherScale},
+    )
+    return [dailyMinTemp, dailyMaxTemp]
+
+
 # @app.route("/updateWeather")
-@scheduler.task("interval", id="updateWeather", seconds=120, misfire_grace_time=900)
+@scheduler.task("interval", id="updateWeather", hours=12, misfire_grace_time=900)
 def updateWeather():
     print("Updating Weather")
-    r = requests.get(forcastURL)
-    data = r.json()
-    temp = data["properties"]["periods"][0]["temperature"]
-    value = (temp - cityLow) / (cityHigh - cityLow) * 100
+    URL = (
+        "https://api.openweathermap.org/data/2.5/weather?units=imperial"
+        + "&lat={}".format(lat)
+        + "&lon={}".format(lon)
+        + "&appid={}".format(openweather_token)
+    )
+    resp = requests.get(URL)
+    temp = resp.json()
+    print(temp)
+    print(dailyMinTemp)
+    print(dailyMaxTemp)
+
+    value = (
+        (temp["main"]["temp"] - dailyMinTemp)
+        / (temp["main"]["temp"] - dailyMaxTemp)
+        * 100
+    )
     r = requests.get(
         f"http://localhost:5340/api/v0/dial/{weather_dial_UID}/set",
         params={"key": VU_Key, "value": value},
     )
-
     return r.json()
+
+
+@app.route("/spotify")
+def spotifyAuth():
+    if not spotify.authorized:
+        return redirect(url_for("spotify.login"))
+    resp = spotify.get("/user")
+    assert resp.ok
+    return "You are @{login} on spotify".format(login=resp.json()["login"])
+
+
+# @app.route("/callbackSpotify")
+# def callbackSpotify():
 
 
 # @app.route("/updateEvents")
@@ -132,8 +188,8 @@ def updateEvent():
         "shy@hackny.org",
         "t8c5iip0pbh62sfvjm8nhn2mko5sgn2o@import.calendar.google.com",
     ]
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if os.path.exists("google_auth/token.json"):
+        creds = Credentials.from_authorized_user_file("google_auth/token.json", SCOPES)
     try:
         service = build("calendar", "v3", credentials=creds)
         # Call the Calendar API
@@ -170,7 +226,6 @@ def updateEvent():
 
         eventStart = pendulum.parse(nextEvent["start"]["dateTime"])
         timeRemaining = eventStart.diff(pendulum.now()).in_minutes()
-        print(timeRemaining)
         if timeRemaining >= 360:
             # Greater than 6 hours.
             calScale = generateScale(
@@ -233,7 +288,6 @@ def updateEvent():
             calScale = generateScale(
                 60, 0, " Min", f"{nextEvent['summary']}", clock_icon_path
             )
-            print(100 * ((60 - timeRemaining) / 60))
             r = requests.get(
                 f"http://localhost:5340/api/v0/dial/{cal_dial_UID}/set",
                 params={"key": VU_Key, "value": 100 * ((60 - timeRemaining) / 60)},
@@ -254,4 +308,15 @@ def updateEvent():
         print(f"An error occurred: {error}")
 
 
+@app.route("/")
+def manualUpdate():
+    updateEvent()
+    updateWeather()
+    return "Manual Run Triggered."
+
+
+[dailyMinTemp, dailyMaxTemp] = buildWeatherScale()
 scheduler.start()
+
+if __name__ == "__main__":
+    app.run(ssl_context="adhoc")
